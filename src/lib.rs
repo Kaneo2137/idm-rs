@@ -3,15 +3,20 @@
 use std::{
     fs::File,
     io::{Read, Seek, Write},
+    path::Path,
     sync::mpsc,
     vec,
 };
 
+use reqwest::{
+    blocking::{Client, Response},
+    header::*,
+};
 use threadpool::ThreadPool;
 
 pub struct ConfigBuilder {
     url: reqwest::Url,
-    connections: u8,
+    connections: usize,
     threads: u8,
     singlecore: Option<bool>,
     filename: Option<String>,
@@ -30,7 +35,7 @@ impl ConfigBuilder {
         }
     }
 
-    pub fn connection_number(&mut self, num: u8) -> &mut ConfigBuilder {
+    pub fn connection_number(&mut self, num: usize) -> &mut ConfigBuilder {
         self.connections = num;
         self
     }
@@ -70,7 +75,7 @@ impl ConfigBuilder {
 #[derive(Debug)]
 pub struct Config {
     url: reqwest::Url,
-    connections: u8,
+    connections: usize,
     threads: u8,
     singlecore: Option<bool>,
     filename: Option<String>,
@@ -109,128 +114,171 @@ impl Downloader {
         Downloader { config }
     }
 
-    pub fn download(self) {
-        use reqwest::header::*;
-
+    pub fn download(&self) {
         let mut headers = HeaderMap::default();
         headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+        {
+            let agent = self
+                .config
+                .user_agent
+                .clone()
+                .unwrap_or_else(|| "idm-rs/1.0.0".to_string());
+            headers.insert(USER_AGENT, HeaderValue::from_str(agent.as_str()).unwrap());
+        }
 
         let client = reqwest::blocking::Client::builder()
             .default_headers(headers)
             .build()
             .unwrap();
 
-        let test_req = client.get(self.config.url.clone()).send().unwrap();
+        let initial_req = client.get(self.config.url.clone()).send().unwrap();
 
-        if test_req
-            .headers()
-            .contains_key(reqwest::header::TRANSFER_ENCODING)
+        if self.config.singlecore.unwrap_or_else(|| false)
+            || initial_req.headers().contains_key(TRANSFER_ENCODING)
+            || !initial_req.headers().contains_key(CONTENT_LENGTH)
         {
-            println!("{:?}", test_req.headers());
-            todo!("Implement stuff related to TRANSFER_ENCODING header");
+        let filename: String = self
+            .config
+            .filename
+            .clone()
+            .unwrap_or_else(|| Downloader::get_filename(&initial_req));
+
+            self.singlecore_download(filename, client);
+        } else {
+            self.multicore_download(initial_req, client);
+        }
+    }
+
+    fn singlecore_download(&self, filename: String, client: Client) {
+        let mut file = File::create(filename).unwrap();
+        let mut resp = client.get(self.config.url.as_ref()).send().unwrap();
+        let mut buf = vec![0; 10000];
+        loop {
+            let bytes = resp.read(&mut buf).unwrap();
+            if bytes == 0 {
+                break;
+            }
+
+            file.write(&buf).unwrap();
+        }
+    }
+
+    fn multicore_download(&self, resp: Response, client: Client) {
+        let content_length = resp.content_length().unwrap() as usize;
+        let chunk_size = (content_length + self.config.connections - 1) / self.config.connections;
+
+        let (sender, receiver) = mpsc::channel();
+        let threadpool = ThreadPool::new(self.config.threads.into());
+
+        for i in 0..self.config.connections {
+            let tx = sender.clone();
+            let range = (chunk_size * i, chunk_size * (i + 1) - 1);
+            let req = client.get(self.config.url.as_ref());
+            threadpool.execute(move || {
+                Downloader::download_chunk(tx, req, range);
+            });
         }
 
-        let filename = self.config.filename.unwrap_or_else(|| {
-            if test_req
-                .headers()
-                .contains_key(reqwest::header::CONTENT_DISPOSITION)
-            {
-                String::try_from(
-                    test_req.headers()[reqwest::header::CONTENT_DISPOSITION]
-                        .to_str()
-                        .unwrap()
-                        .split('=')
-                        .last()
-                        .unwrap()
-                        .replace(&['\'', '"'], ""),
-                )
-                .unwrap()
-            } else {
-                test_req
-                    .url()
-                    .to_string()
-                    .split('/')
-                    .last()
-                    .unwrap()
-                    .split('?')
-                    .next()
-                    .unwrap()
-                    .to_string()
-            }
-        });
-
-        let content_length = test_req.content_length().unwrap();
-
-        let threads = ThreadPool::new(self.config.threads.into());
-
-        let (tx, rx) = mpsc::channel();
-        {
-            let chunk_size;
-            if self.config.singlecore.unwrap_or_else(|| false) || self.config.connections == 1 {
-                chunk_size = content_length;
-            } else {
-                chunk_size = (content_length + self.config.connections as u64 - 1) / self.config.connections as u64;
-            }
-
-            for i in 0..self.config.connections as u64 {
-                let tx = tx.clone();
-                let range = (chunk_size * i, chunk_size * (i + 1) - 1);
-                let range_text = format!("bytes={}-{}", range.0, range.1);
-                let url = self.config.url.clone();
-                let req = client.get(url).header(RANGE, range_text);
-                threads.execute(move || {
-                    Downloader::download_chunk(tx, req, range);
-                });
-            }
-        }
+        let filename: String = self
+            .config
+            .filename
+            .clone()
+            .unwrap_or_else(|| Downloader::get_filename(&resp));
 
         let mut file = File::create(filename).unwrap();
-        file.write(vec![0; content_length as usize].as_slice())
-            .unwrap();
-        let mut size: isize = content_length as isize;
+        file.write(vec![0; content_length].as_slice()).unwrap();
+        let mut size = content_length;
 
-        while size > 0 {
-            let chunk = rx.recv().unwrap();
-            size -= chunk.byte_count as isize;
+        while size != 0 {
+            let chunk = receiver.recv().unwrap();
+            size -= chunk.byte_count;
 
-            file.seek(std::io::SeekFrom::Start(chunk.offset)).unwrap();
+            file.seek(std::io::SeekFrom::Start(chunk.offset as u64))
+                .unwrap();
             file.write_all(&chunk.data).unwrap();
             file.flush().unwrap();
-
-            println!("{}", size);
         }
+    }
+
+    fn get_filename(req: &Response) -> String {
+        let mut filename;
+        if req
+            .headers()
+            .contains_key(reqwest::header::CONTENT_DISPOSITION)
+        {
+            filename = String::try_from(
+                req.headers()[reqwest::header::CONTENT_DISPOSITION]
+                    .to_str()
+                    .unwrap()
+                    .split('=')
+                    .last()
+                    .unwrap()
+                    .replace(&['\'', '"'], ""),
+            )
+            .unwrap()
+        } else {
+            filename = req
+                .url()
+                .to_string()
+                .split('/')
+                .last()
+                .unwrap()
+                .split('?')
+                .next()
+                .unwrap()
+                .to_string()
+        }
+
+        while Path::new(&filename).exists() {
+            let mut name = format!(
+                "{}_new",
+                filename.split(".").next().expect("thats a weird file")
+            );
+            // making sure that things like file.tar.gz get renamed properly
+            for (index, word) in filename.split(".").into_iter().enumerate() {
+                if index == 0 {
+                    continue;
+                }
+                name = name + "." + &word.to_owned();
+            }
+            filename = name;
+        }
+
+        filename
     }
 
     fn download_chunk(
         tx: mpsc::Sender<Chunk>,
         req: reqwest::blocking::RequestBuilder,
-        mut range: (u64, u64),
+        mut range: (usize, usize),
     ) {
+        let mut req = req
+            .header(RANGE, format!("bytes={}-{}", range.0, range.1))
+            .send()
+            .unwrap();
         let size = range.1 - range.0;
-        let mut req = req.send().unwrap();
         loop {
-            let mut data = vec![0u8; size as usize];
+            let mut data = vec![0u8; size];
             let byte_count = req.read(data.as_mut_slice()).unwrap();
-            data.truncate(byte_count);
-            if data.is_empty() {
+            if byte_count == 0 {
                 break;
             }
-            data.truncate(byte_count);
+            data.truncate(byte_count as usize);
             tx.send(Chunk {
                 data,
-                byte_count: byte_count as u64,
+                byte_count,
                 offset: range.0,
             })
             .unwrap();
 
-            range.0 += byte_count as u64;
+            range.0 += byte_count;
         }
     }
 }
 
 struct Chunk {
-    byte_count: u64,
-    offset: u64,
+    byte_count: usize,
+    offset: usize,
     data: Vec<u8>,
 }

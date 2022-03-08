@@ -2,13 +2,6 @@ mod lib;
 use clap::{arg, Command};
 use idm_rs::{Config, Downloader};
 
-/*
- *  TODO:
- *  - Wyodrębnij cały proces pobierania do oddzielnej struktury
- *  - Obecnie sposób pobierania jest trochę hacky, próba z wieloma wątkami i chunki?
- *  - Jakiś sposób konfiguracji z urla i opcji, aby łatwiej korzystało się z biblioteki
- */
-
 fn main() {
     let matches = Command::new("idm-rs")
         .author("Konrad Nowakowski")
@@ -50,43 +43,4 @@ fn main() {
 
     let _downloader = Downloader::from_config(configbuilder.build()).download();
 
-    return;
-
-/*
-    let start = std::time::Instant::now();
-
-    let mut requests = vec![];
-
-    for offset in offsets {
-        let req = client.get(url).header(RANGE, offset);
-        let fut = tokio::task::spawn(download_chunk(req));
-        requests.push(fut);
-    }
-
-    let results =
-        thread::spawn(move || futures::executor::block_on(futures::future::join_all(requests)))
-            .join()
-            .unwrap();
-
-    //let results = futures::future::join_all(requests).await;
-
-    let mut file = vec![];
-    for result in results {
-        let res: Result<Vec<u8>, reqwest::Error> = result.unwrap();
-        file.append(&mut res.unwrap());
-    }
-
-    println!(
-        "Elapsed since download start: {:?}",
-        std::time::Instant::now().duration_since(start)
-    );
-
-    let mut out = File::create(filename).expect("failed to create file");
-    out.write(&file).unwrap();
-*/
 }
-
-//async fn download_chunk(req: RequestBuilder) -> Result<Vec<u8>, reqwest::Error> {
-//    let bytes = req.send().await?.bytes().await?;
-//    Ok(bytes.to_vec())
-//}
